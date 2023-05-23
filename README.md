@@ -32,7 +32,7 @@ $newBody = new-object PSObject @{
 In order to clean up the task hub, we've also included a `CleanupFunction`, whose HTTP endpoint is to be sent a POST JSON object containing:
 ```
 {
-    "ConnectionString":  "DefaultEndpointsProtocol=https;AccountName=sauksels1ldevbench;AccountKey=jdhn5kkz3fzKxxxxxxxKoyXMPmoqoYRuKdaH4ojaoC9FTwL0r93WnojJIc8kiTQPzRUJIe4vj0ft+AStwGKJGg==;EndpointSuffix=core.windows.net"  
+    "ConnectionString":  "DefaultEndpointsProtocol=https;AccountName=sauksels1ldevbench;AccountKey=jdhn5kkz3fzKxxxxxxxyouthoughthiswasagoodkeYH4ojaoC9FTwL0r93WnojJIc8kiTQPzRUJIe4vj0ft+AStwGKJGg==;EndpointSuffix=core.windows.net"  
 }
 ```
 
