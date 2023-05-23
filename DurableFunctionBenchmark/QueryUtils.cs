@@ -14,13 +14,14 @@ namespace DurableFunctionBenchmark
     static class Utils
     {
         static Random jitter = new Random();
+        static Random rndChar = new Random();
 
-        public static int GetRetryWait(TimeSpan delay)
+        public static int GetRetryWait(TimeSpan delay, double fraction = 1.0)
         {
-            var cosmosDelay = (int)delay.TotalMilliseconds;
-            var jitterMax = (int)(delay.TotalMilliseconds * 0.2);
+            var cosmosDelay = delay.TotalMilliseconds * fraction;
+            var jitterMax = (delay.TotalMilliseconds * 0.2);
 
-            return cosmosDelay + jitter.Next(jitterMax);
+            return (int)cosmosDelay + jitter.Next((int)jitterMax);
         }
 
         public static QueryRequestOptions queryRequestOptions = new QueryRequestOptions()
@@ -157,6 +158,18 @@ namespace DurableFunctionBenchmark
             };
 
             return returnDoc;
+        }
+
+        internal static string GenerateRandomStringOfLength(int payloadSize)
+        {
+            const string characters = "01234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            StringBuilder outputString = new StringBuilder(string.Empty);
+            for(int i = 0; i < payloadSize; i++) 
+            { 
+                outputString.Append(characters[rndChar.Next(characters.Length)]);
+            }
+
+            return outputString.ToString();
         }
     }
 }

@@ -1,19 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.IO.Compression;
 using System.Linq;
-using System.Net.Http;
-using System.Reflection.Metadata;
 using System.Threading.Tasks;
-using doc = Microsoft.Azure.Documents;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-using Microsoft.Azure.Cosmos.Serialization.HybridRow;
-using Microsoft.AspNetCore.Mvc;
 using System.Threading;
 
 namespace DurableFunctionBenchmark
@@ -26,19 +18,25 @@ namespace DurableFunctionBenchmark
         {
             var Log = context.CreateReplaySafeLogger(log);
 
-            var input = context.GetInput<TriggerOrchestratorInput>();
-            if (input is null)
+            var compressedInput = context.GetInput<CompressedObject<TriggerOrchestratorInput>>();
+            if (compressedInput is null)
             {
                 Log.LogCritical($"{context.Name} got a null buffer and ignoring");
                 return "Null";
             }
+
+            var input = compressedInput.Get<TriggerOrchestratorInput>();
 
             var directString = input.Direct ? "[Direct Launch]" : "[Indirect Launch]";
             var partitionString = input.UseMixedPartitionKey ? "[Mixed Partition Key]" : "[Fixed Partition Key]";
             var useBulk = input.UseBulk;
             var bulkString = useBulk ? "[Cosmos Bulk container]" : "[Cosmos regular container]";
 
+            var cosmosWaitFraction = input.CosmosWaitFraction;
             var fullContext = $"{context.Name} {context.InstanceId}";
+
+            // this is known good by now
+            var compressionLevel = compressedInput.CompressionLevel;
 
             var runId = input.RunId ?? context.NewGuid().ToString();
             var subOrchestratorCount = input.SubOrchestratorCount >= 0 ? input.SubOrchestratorCount : throw new ArgumentOutOfRangeException(nameof(input.SubOrchestratorCount));
@@ -50,10 +48,12 @@ namespace DurableFunctionBenchmark
             var throughput = input.CosmosThroughput;
 
             var testParameters = input.TestParameters;
-            var testDescription = string.Empty;
+            var testDescription = input.TestDescription;
 
-            var docs = new List<JObject>();
-            var payload = "big payload in the future";
+            var documents = input.Documents;
+
+            var payload = input.PayloadSize == 0 ? string.Empty
+                                    : Utils.GenerateRandomStringOfLength(input.PayloadSize);
 
             context.SetCustomStatus(new QueryOrchestratorStatus()
             {
@@ -63,6 +63,7 @@ namespace DurableFunctionBenchmark
                 Message = $"{testParameters}: Initialized",
                 Status = "Running",
                 StatisticsDocument = null,
+                CosmosThroughput = throughput,
             });
 
             Log.LogInformation($"{testParameters}");
@@ -79,9 +80,10 @@ namespace DurableFunctionBenchmark
                 {
                     tasks.Add(context.CallSubOrchestratorAsync<SubOrchestratorOutput>(
                         nameof(BandSectionSubOrchestrator),
-                        new SubOrchestratorInput()
+                        CompressedObject<SubOrchestratorInput>.Create(
+                            new SubOrchestratorInput()
                         {
-                            Documents = docs,
+                            Documents = documents,
                             RunId = runId,
                             RunStartTime = startTime,
                             OrchestratorQueueTime = context.CurrentUtcDateTime,
@@ -93,9 +95,10 @@ namespace DurableFunctionBenchmark
                             ItemCount = itemCount,
                             UseMixedPartitionKey = input.UseMixedPartitionKey,
                             UseBulk = useBulk,
+                            CosmosWaitFraction = cosmosWaitFraction,
                             DocumentSize = documentSize,
                             Payload = payload,
-                        })) ;
+                        }, compressionLevel)));
                 }
 
                 await Task.WhenAll(tasks);
@@ -129,6 +132,39 @@ namespace DurableFunctionBenchmark
                     var itemsPerSecond = grandTotalTotalTasks / runTime.TotalSeconds;
                     log.LogWarning($"{nameof(BandConductorOrchestrator)} {grandTotalTotalTasks} ({subOrchestratorCount}*{activityCount}*{itemCount}) in {runTime} - {itemsPerSecond} items/sec");
 
+                    var statsDoc = new StatisticsDocument()
+                    {
+                        RunId = runId,
+                        TestDescription = testDescription,
+                        TestParameters = testParameters,
+                        id = context.NewGuid().ToString(),
+                        PayloadSize = payload.Length,
+                        DocumentSize = 0,
+                        CompressionLevel = compressionLevel,
+                        StartTime = startTime,
+                        EndTime = endTime,
+                        MinActivityDequeueDelay = minActivityDequeueDelay,
+                        MaxActivityDequeueDelay = maxActivityDequeueDelay,
+                        MinOrchestratorDequeueDelay = minOrchestratorDequeueDelay,
+                        MaxOrchestratorDequeueDelay = maxOrchestratorDequeueDelay,
+                        ActivityQueueDelayVariance = maxActivityDequeueDelay - minActivityDequeueDelay,
+                        OrchestratorQueueDelayVariance = maxOrchestratorDequeueDelay - minOrchestratorDequeueDelay,
+                        EnqueueEndTime = endTime,
+                        EnqueueStartTime = startTime,
+                        EnqueueTime = endTime - startTime,
+                        RunTime = endTime - startTime,
+                        MinActivityOutputDequeueDelay = minActivityOutputDequeueDelay,
+                        MaxActivityOutputDequeueDelay = maxActivityOutputDequeueDelay,
+                        MinOrchestratorOutputDequeueDelay = minOrchestratorOutputDequeueDelay,
+                        MaxOrchestratorOutputDequeueDelay = maxOrchestratorOutputDequeueDelay,
+                        EnqueuedItemsPerSecond = grandTotalTotalTasks / runTime.TotalSeconds,
+                        MinRunTime = minProcessingClockTime,
+                        ProcessedActivitiesPerSecond = grandTotalTotalTasks / runTime.TotalSeconds,
+                        ProcessedItemsPerSecond = grandTotalTotalTasks / runTime.TotalSeconds,
+                    };
+
+                    await context.CallActivityAsync(nameof(StoreCosmosStatisticsActivity), statsDoc);
+
                     context.SetCustomStatus(new QueryOrchestratorStatus()
                     {
                         RunId = runId,
@@ -148,8 +184,7 @@ namespace DurableFunctionBenchmark
                         MaxActivityOutputDequeueDelay = maxActivityOutputDequeueDelay,
                         MinOrchestratorOutputDequeueDelay = minOrchestratorOutputDequeueDelay,
                         MaxOrchestratorOutputDequeueDelay = maxOrchestratorOutputDequeueDelay,
-                        // Statistics document isn't used in this instance.
-                        StatisticsDocument = null,
+                        StatisticsDocument = statsDoc,
                     });
 
                     return "Completed all tasks";
@@ -163,6 +198,8 @@ namespace DurableFunctionBenchmark
 
             await DoWaitUsingTimer(context, TimeSpan.FromSeconds(1));
 
+            throughput = await context.CallActivityAsync<int>(nameof(GetCosmosThroughputActivity), null);
+
             context.SetCustomStatus(new QueryOrchestratorStatus()
             {
                 RunId = runId,
@@ -173,6 +210,7 @@ namespace DurableFunctionBenchmark
                 LastQueryTime = 0.0,
                 LastQueryCharge = 0.0,
                 StatisticsDocument = null,
+                CosmosThroughput = throughput,
             }) ;
 
             // if we're Direct, Bandleader calls the above, and this orchestrator is only used for
@@ -209,6 +247,8 @@ namespace DurableFunctionBenchmark
                         _ = ex;
                     }
 
+                    throughput = await context.CallActivityAsync<int>(nameof(GetCosmosThroughputActivity), null);
+
                     try
                     {
                         Log.LogWarning($"{fullContext} {runId} got {docCount} of {totalItems} documents");
@@ -222,6 +262,7 @@ namespace DurableFunctionBenchmark
                             Status = "Running",
                             Message = $"RunId {runId}: Waiting for documents ({tryNumber}), {docCount} written",
                             StatisticsDocument = null,
+                            CosmosThroughput = throughput,
                         });
                     }
                     catch(Exception ex)
@@ -242,6 +283,8 @@ namespace DurableFunctionBenchmark
 
             Log.LogWarning($"{fullContext} RunId:{runId} got all {totalItems} documents");
 
+            throughput = await context.CallActivityAsync<int>(nameof(GetCosmosThroughputActivity), null);
+
             context.SetCustomStatus(new QueryOrchestratorStatus()
             {
                 RunId = runId,
@@ -252,6 +295,7 @@ namespace DurableFunctionBenchmark
                 StatisticsDocument = null,
                 ExpectedReturnCount = totalItems,
                 ReturnCount = totalItems,
+                CosmosThroughput = throughput,
             });
 
             var statsQueryString =                 
@@ -283,7 +327,7 @@ namespace DurableFunctionBenchmark
             }
 
             res = result["Documents"]?.ToObject<List<StatisticsDocument>>()[0];
-            res.id = Guid.NewGuid().ToString();
+            res.id = context.NewGuid().ToString();
 
             res.RunId = runId;
             res.RunTime = res.EndTime - res.StartTime;
@@ -305,9 +349,12 @@ namespace DurableFunctionBenchmark
             res.ProcessedActivitiesPerSecond = totalActivities / res.RunTime.TotalSeconds;
             res.ProcessedItemsPerSecond = totalItems / res.RunTime.TotalSeconds;
 
+            res.CosmosWaitFraction = cosmosWaitFraction;
             res.CosmosThroughput = throughput;
 
             await context.CallActivityAsync<bool>(nameof(StoreCosmosStatisticsActivity),res);
+
+            throughput = await context.CallActivityAsync<int>(nameof(GetCosmosThroughputActivity), null);
 
             context.SetCustomStatus(new QueryOrchestratorStatus()
             {
@@ -320,6 +367,7 @@ namespace DurableFunctionBenchmark
                 StatisticsDocument = res,
                 ExpectedReturnCount = totalItems,
                 ReturnCount = totalItems,
+                CosmosThroughput = throughput,
             }) ;
 
             Log.LogInformation($"{fullContext} RunId:{runId} set final status");

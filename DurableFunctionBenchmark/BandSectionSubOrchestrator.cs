@@ -1,17 +1,11 @@
 using System;
 using System.Collections.Generic;
+using System.IO.Compression;
 using System.Linq;
-using System.Net.Http;
-using System.Reflection.Metadata;
 using System.Threading.Tasks;
-using doc = Microsoft.Azure.Documents;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Azure.WebJobs.Extensions.Http;
-using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 
 namespace DurableFunctionBenchmark
 {
@@ -23,26 +17,35 @@ namespace DurableFunctionBenchmark
         {
             var Log = context.CreateReplaySafeLogger(log);
 
-            var input = context.GetInput<SubOrchestratorInput>();
-            var docs = input.Documents;
+            var compressedInput = context.GetInput<CompressedObject<SubOrchestratorInput>>();
+
+            var input = compressedInput.Get<SubOrchestratorInput>();
+
+            var documents = input.Documents;
             var runId = input.RunId;
             var subOrchNo = input.SubOrchestratorNumber;
             var activityCount = input.ActivityCount;
             var itemCount = input.ItemCount;
             var useBulk = input.UseBulk;
             var bulkString = useBulk ? "[Cosmos Bulk container]" : "[Cosmos regular container]";
+            var cosmosWaitFraction = input.CosmosWaitFraction;
+
+            var compressionLevel = input.CompressionLevel;
 
             var documentSize = input.DocumentSize;
+            var payLoad = input.Payload;
 
-            Log.LogWarning($"{context.Name} starting orchestrator for RunId:{runId}, #{subOrchNo}, launching {activityCount} activities");
+            Log.LogWarning($"{context.Name} starting orchestrator for RunId:{runId}, #{subOrchNo}, launching {activityCount} activities,\n"
+                + $" using {compressedInput.CompressionLevel} compression, factor {compressedInput.CompressionFactor:0.000} in {compressedInput.CompressTime.TotalMilliseconds}mS to compress and {compressedInput.UnCompressTime.TotalMilliseconds}mS to uncompress {compressedInput.UnCompressedLength} length data");
 
             var tasks = new List<Task<InstrumentActivityOutput>>();
             for (int t = 1; t <= activityCount; t++)
             {
                 var fInput
-                    = new InstrumentActivityInput()
+                    = CompressedObject<InstrumentActivityInput>.Create(
+                        new InstrumentActivityInput()
                     {
-                        Documents = docs,
+                        Documents = documents,
                         RunId = runId,
                         RunStartTime = input.RunStartTime,
                         OrchestratorQueueTime = input.OrchestratorQueueTime,
@@ -54,10 +57,12 @@ namespace DurableFunctionBenchmark
                         DelayTime = 1,
                         ActivityNumber = t,
                         UseMixedPartitionKey = input.UseMixedPartitionKey,
+                        PayLoad = payLoad,
                         DocumentSize = documentSize,
                         UseBulk = useBulk,
+                        CosmosWaitFraction = cosmosWaitFraction,
                         ItemCount = itemCount,
-                    };
+                    }, compressionLevel);
 
                 int retryNumber = 0;
                 tasks.Add(context.CallActivityWithRetryAsync<InstrumentActivityOutput>(
@@ -98,7 +103,7 @@ namespace DurableFunctionBenchmark
             if (tasks.Count != totalTasks)
             {
                 var badTasks = tasks.Where(t => t.Result.SuccessCount == 0).ToList();
-                Log.LogError($"not all ({badTasks.Count}) tasks marked themselves as completing succesfully");
+                Log.LogError($"not all tasks marked themselves as completing succesfully -- {badTasks.Count} failed");
                 foreach (var bTask in badTasks)
                 {
                     var exMsg = bTask?.Exception?.Message ?? "no exception";
@@ -106,7 +111,7 @@ namespace DurableFunctionBenchmark
                 }
             }
 
-            Log.LogWarning($"{nameof(BandSectionSubOrchestrator)} completed {goodTasks} of {totalTasks} tasks for Orchestrator {subOrchNo} with a maximum {maxRetries} throttle retries, max:{maxTime}");
+            Log.LogWarning($"{nameof(BandSectionSubOrchestrator)} completed {goodTasks} of {tasks.Count} tasks for Orchestrator {subOrchNo} with a maximum {maxRetries} throttle retries, max:{maxTime}");
 
             var returnObject = new SubOrchestratorOutput()
             {

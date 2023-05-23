@@ -18,15 +18,17 @@ namespace DurableFunctionBenchmark
         [FunctionName(nameof(BandInstrumentActivity))]
         public async Task<InstrumentActivityOutput> Run([ActivityTrigger] IDurableActivityContext context, ILogger log)
         {
-            var input = context.GetInput<InstrumentActivityInput>();
+            var sw = Stopwatch.StartNew();
+
+            var compressedInput = context.GetInput<CompressedObject<InstrumentActivityInput>>();
+
+            var input = compressedInput.Get<InstrumentActivityInput>();
+
             var itemCount = input.ItemCount;
             var useBulk = input.UseBulk;
+            var cosmosWaitFraction = input.CosmosWaitFraction;
             var documentSize = input.DocumentSize;
-
-            // for now, no real work
-            //            await Task.Delay(input.DelayTime);
-
-            var sw = Stopwatch.StartNew();
+            var payLoad = input.PayLoad;
 
             int retriesAttempted = 0;
             TimeSpan retryTimeSpan = TimeSpan.FromSeconds(0);
@@ -80,36 +82,40 @@ namespace DurableFunctionBenchmark
             var taskList = new List<Task>();
             for (int i = 0; i < itemCount; i++)
             {
-                var doc = docList[i];
-                log.LogDebug($"{context.Name} starting Orch:{input.SubOrchestratorNumber} Act:{input.ActivityNumber} Item:{i}");
-
-                while (input.DocumentSize > 0)
+                int index = i;
+                taskList.Add( Task.Run(async () =>
                 {
-                    try
-                    {
-                        await CosmosContainer.Container.UpsertItemAsync<BenchmarkDocument>(doc);
-                        successCount++;
+                    var doc = docList[index];
+                    log.LogDebug($"{context.Name} starting Orch:{input.SubOrchestratorNumber} Act:{input.ActivityNumber} Item:{i}");
 
-                        break;
-                    }
-                    catch (CosmosException cx) when (cx.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                    while (input.DocumentSize > 0)
                     {
-                        retriesAttempted++;
-                        var retryWait = Utils.GetRetryWait(cx.RetryAfter.Value);
-                        retryTimeSpan += TimeSpan.FromMilliseconds(retryWait);
+                        try
+                        {
+                            await CosmosContainer.Container.UpsertItemAsync<BenchmarkDocument>(doc);
+                            successCount++;
 
-                        doc.CosmosUpsertRetries = retriesAttempted;
-                        doc.CosmosUpsertRetryTime = retryTimeSpan;
-                            
-                        await Task.Delay(retryWait);
+                            break;
+                        }
+                        catch (CosmosException cx) when (cx.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                        {
+                            retriesAttempted++;
+                            var retryWait = Utils.GetRetryWait(cx.RetryAfter.Value, cosmosWaitFraction);
+                            retryTimeSpan += TimeSpan.FromMilliseconds(retryWait);
+
+                            doc.CosmosUpsertRetries = retriesAttempted;
+                            doc.CosmosUpsertRetryTime = retryTimeSpan;
+
+                            await Task.Delay(retryWait);
+                        }
+                        catch (CosmosException cx)
+                        {
+                            log.LogError($"COSMOSEXCEPTION: cosmos other exception {doc.partitionKey}:{doc.id} \n {cx.Message}");
+                            // unrecoverable, bail
+                            break;
+                        }
                     }
-                    catch(CosmosException cx)
-                    {
-                        log.LogError($"COSMOSEXCEPTION: cosmos other exception {doc.partitionKey}:{doc.id} \n {cx.Message}");
-                        // unrecoverable, bail
-                        break;
-                    }
-                }
+                }));
             }
 
             await Task.WhenAll(taskList);

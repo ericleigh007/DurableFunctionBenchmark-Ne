@@ -38,7 +38,7 @@
   "extensions": {
     "durableTask": {
 
-      "hubName": "perftests",
+      "hubName": "perftest16",
 
       "UseGracefulShutdown": true, // helps to avoid lengthy waits for lease expiration
 
@@ -48,7 +48,7 @@
       "storageProvider": {
 
         "type": "Netherite",
-        // "type": "AzureStorage",
+       // "type": "AzureStorage",
 
         "StorageConnectionName": "AzureWebJobsStorage",
         "EventHubsConnectionName": "EventHubsConnection",
@@ -60,7 +60,7 @@
 
         "PackPartitionTaskMessages": 100,
 
-        "PartitionCount": 12,
+        "PartitionCount": 16,
 
         // set this to false to force replay on each orchestration step
         "CacheOrchestrationCursors": true,

@@ -24,6 +24,8 @@ using System.Security.Permissions;
 using System.Reflection.Metadata;
 using Microsoft.Identity.Client;
 using static System.Net.Mime.MediaTypeNames;
+using System.IO.Compression;
+using System.Text;
 
 namespace DurableFunctionBenchmark
 {
@@ -35,7 +37,10 @@ namespace DurableFunctionBenchmark
         public int ItemCount { get; set; }
         public int PayloadSize { get; set; }
         public int DocumentSize { get; set; } = 100;
+        public JObject Documents { get; set; }
+        public string CompressionLevel { get; set; }
         public string TestParameters { get; set; }
+        public string TestDescription { get; set; }
         public bool Direct { get; set; }
         public bool UseMixedPartitionKey { get; set; }
         public bool UseBulk { get; set; }
@@ -43,12 +48,15 @@ namespace DurableFunctionBenchmark
         public DateTime LaunchEndTime { get; set; }
 
         public bool Debug { get; set; }
+        // fraction of the time that cosmos returns for the retry that we'll actually wait to retry
+        public double CosmosWaitFraction { get; set; }
         public int CosmosThroughput { get; set; }
     }
 
     public class SubOrchestratorInput
     {
-        public List<JObject> Documents { get; set; }
+        public JObject Documents { get; set; }
+        public CompressionLevel CompressionLevel { get; set; }
         public int DocumentSize { get; set; }
         public string RunId { get; set; }
         public DateTime RunStartTime { get; set; }
@@ -61,12 +69,14 @@ namespace DurableFunctionBenchmark
         public int ItemCount { get; set; }
         public bool UseMixedPartitionKey { get; set; }
         public bool UseBulk { get; set; }
+        public double CosmosWaitFraction { get; set; }
         public string Payload { get; set; }
     }
 
     public class InstrumentActivityInput
     {
-        public List<JObject> Documents { get; set; }
+        public JObject Documents { get; set; }
+        public CompressionLevel CompressionLevel { get; set; }
         public string RunId { get; set; }
         public string TestParameters { get; set; }
         public string TestDescription { get; set; }
@@ -76,10 +86,12 @@ namespace DurableFunctionBenchmark
         public string SubOrchestratorId { get; set; }
         public int SubOrchestratorNumber { get; set; }
         public int ItemCount { get; set; }
+        public string PayLoad { get; set; }
         public int DocumentSize { get; set; }
         public int ActivityNumber { get; set; }
         public bool UseMixedPartitionKey { get; set; }
         public bool UseBulk { get; set; }
+        public double CosmosWaitFraction { get; set; }
         public int DelayTime { get; set; }
     }
 
@@ -167,7 +179,7 @@ namespace DurableFunctionBenchmark
                         CosmosContainer.ConnectionString,
                         new List<(string db, string container)>()
                         {
-                        ( CosmosContainer.DatabaseName, CosmosContainer.ContainerName),
+                            ( CosmosContainer.DatabaseName, CosmosContainer.ContainerName),
                         },
                         clientOptions);
                 }
@@ -216,7 +228,7 @@ namespace DurableFunctionBenchmark
 
     public class QueryOrchestratorStatus
     {
-        public string Version { get; set; } = "Durable Functions Benchmark-Ne, V0.2, 2023-03-21";
+        public string Version => BandLeader.Version;
         public string Status { get; set; }
         public string Message { get; set; }
         public string RunId { get; set; }
@@ -242,7 +254,8 @@ namespace DurableFunctionBenchmark
 
     public class StatisticsDocument
     {
-        public string Kind { get; set; } = "Statistics";
+        public string Kind { get; } = "Statistics";
+        public string Version => BandLeader.Version;
         public string RunId { get; set; }
         public string partitionKey => RunId;
         public string id { get; set; }
@@ -250,6 +263,7 @@ namespace DurableFunctionBenchmark
         public string TestDescription { get; set; }
         public int PayloadSize { get; set; }
         public int DocumentSize { get; set; }
+        public CompressionLevel CompressionLevel { get; set; }
         public int MinCosmosUpsertRetries { get; set; }
         public int MaxCosmosUpsertRetries { get; set; }
         public TimeSpan MinCosmosUpsertTime { get; set; }
@@ -280,11 +294,14 @@ namespace DurableFunctionBenchmark
         public double ProcessedActivitiesPerSecond { get; set; }
 
         public double ProcessedItemsPerSecond { get; set; }
+        public double CosmosWaitFraction { get; set; }
         public int CosmosThroughput { get; set; }
     }
 
     public class BandLeader
     {
+        public static string Version = "Durable Functions Benchmark-Ne, V0.3, 2023-05-01";
+
         [FunctionName("BandLeader")]
         public async Task<IActionResult> Run(
             [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
@@ -295,6 +312,8 @@ namespace DurableFunctionBenchmark
 
             log.LogInformation($"{nameof(BandLeader)}, parsing body, {json.Length} characters");
 
+            var inputJObject = JsonConvert.DeserializeObject<JObject>(json);
+
             var input = JsonConvert.DeserializeObject<TriggerOrchestratorInput>(json);
 
             var runId = input.RunId ?? Guid.NewGuid().ToString();
@@ -304,6 +323,23 @@ namespace DurableFunctionBenchmark
             var totalResults = subOrchestratorCount * activityCount * itemCount;
             var documentSize = input.DocumentSize;
 
+            var compressionValid = Enum.TryParse<CompressionLevel>(input.CompressionLevel, out var compressionLevel);
+            if(!compressionValid)
+            {
+                compressionLevel = CompressionLevel.NoCompression;
+                log.LogWarning($"{nameof(BandLeader)}, Compression level invalid or not specified");
+            }
+            log.LogInformation($"{nameof(BandLeader)}, Compression level set to {compressionLevel}");
+
+            var documents = input.Documents;
+            var tmpSize = 0;
+
+            documentSize = documents.ToString(Formatting.None).Length;
+            var fullDoc = documents.ToString();
+            var fullDocLen = fullDoc.Length;
+
+            var cosmosWaitFraction = input.CosmosWaitFraction > 0? input.CosmosWaitFraction: 1.0;
+
             var directMode = input.Direct;
             var directString = directMode ? "[DIRECT launch]" : "[indirect launch through orchestrator]";
             var useMixedPartitionKey = input.UseMixedPartitionKey;
@@ -312,16 +348,15 @@ namespace DurableFunctionBenchmark
             var bulkString = useBulk ? "[Cosmos Bulk container]" : "[Cosmos regular container]";
 
             string testParameters = $"Ne: Run:{runId}:OCount:{subOrchestratorCount}:ACount:{activityCount}:ICount{itemCount}, DocSize:{documentSize}, {directString} {bulkString}, Query for {partitionKeyString}";
-            if(input.DocumentSize == 0)
+            if(documentSize == 0)
             {
-                testParameters = $"Ne: Run:{runId}:OCount:{subOrchestratorCount}:ACount:{activityCount}:ICount{itemCount}, {directString} DocSize:{documentSize} NO COSMOS DB";
+                testParameters = $"Run:{runId}:OCount:{subOrchestratorCount}:ACount:{activityCount}:ICount{itemCount}, {directString} DocSize:{documentSize} NO COSMOS DB";
             }
 
-            var testDescription = string.Empty;
+            var testDescription = input.TestDescription;
 
             var docs = new List<JObject>();
-            var payload = "big payload in the future";
-
+            /*
             await CosmosContainer.InitializeAsync(useBulk);
 
             Microsoft.Azure.Cosmos.AccountProperties props = null;
@@ -342,15 +377,20 @@ namespace DurableFunctionBenchmark
                  + $"{props.Id} {props.Consistency.DefaultConsistencyLevel} {props.ReadableRegions.First().Name} {props.WritableRegions.First().Name}");
 
             log.LogInformation($"{nameof(BandLeader)} {testParameters} started creating activities");
+            */
+
+            var throughput = 0;
 
             string instanceId = string.Empty;
-            var oInput = new TriggerOrchestratorInput();
+            CompressedObject<TriggerOrchestratorInput> oInput;
 
             if (!input.Direct)
             {
-                oInput = new TriggerOrchestratorInput()
+                oInput = CompressedObject<TriggerOrchestratorInput>.Create(
+                new TriggerOrchestratorInput()
                 {
                     TestParameters = testParameters,
+                    TestDescription = testDescription,
                     RunId = runId,
                     UseMixedPartitionKey = useMixedPartitionKey,
                     UseBulk = useBulk,
@@ -358,10 +398,13 @@ namespace DurableFunctionBenchmark
                     ActivityCount = activityCount,
                     ItemCount = itemCount,
                     SubOrchestratorCount = subOrchestratorCount,
+                    Documents = documents,
                     DocumentSize = documentSize,
                     PayloadSize = input.PayloadSize,
+                    CosmosWaitFraction = cosmosWaitFraction,
                     CosmosThroughput = throughput,
-                };
+                }, compressionLevel);
+
                 instanceId = await starter.StartNewAsync(nameof(BandConductorOrchestrator), oInput);
 
                 log.LogInformation($"{nameof(BandLeader)} Orchestrator mode -- using {nameof(BandConductorOrchestrator)} to launch {subOrchestratorCount} orchestrators");
@@ -369,11 +412,16 @@ namespace DurableFunctionBenchmark
                 return starter.CreateCheckStatusResponse(req, instanceId);
             }
 
-            if (input.DocumentSize == 0)
+            if (documentSize == 0)
             {
                 log.LogInformation($"Specify 'Direct = false' and 'DocumentSize = 0' in order to test backend without cosmos");
                 return new BadRequestObjectResult("Specify 'Direct = false' and 'DocumentSize = 0' in order to test backend only");
             }
+
+            // note: because of the more realistic content, sending Documents vs using the Payload string is
+            // recommended.
+            var payload = input.PayloadSize == 0 ? string.Empty
+                                    : Utils.GenerateRandomStringOfLength(input.PayloadSize);
 
             log.LogInformation($"{nameof(BandLeader)} DIRECT mode -- launching {subOrchestratorCount} orchestrators");
 
@@ -384,9 +432,10 @@ namespace DurableFunctionBenchmark
             {
                 tasks.Add(starter.StartNewAsync(
                     nameof(BandSectionSubOrchestrator),
-                    new SubOrchestratorInput()
+                    CompressedObject<SubOrchestratorInput>.Create(
+                        new SubOrchestratorInput()
                     {
-                        Documents = docs,
+                        Documents = documents,
                         RunId = runId,
                         RunStartTime = startTime,
                         OrchestratorQueueTime = DateTime.UtcNow,
@@ -399,8 +448,9 @@ namespace DurableFunctionBenchmark
                         UseMixedPartitionKey = useMixedPartitionKey,
                         UseBulk = useBulk,
                         DocumentSize = documentSize,
+                        CosmosWaitFraction = cosmosWaitFraction,
                         Payload = payload,
-                    }));
+                    }, compressionLevel)));
             }
 
             await Task.WhenAll(tasks);
@@ -411,7 +461,8 @@ namespace DurableFunctionBenchmark
 
             log.LogInformation($"{nameof(BandLeader)} all {subOrchestratorCount} orchestrators queuing complete");
 
-            oInput = new TriggerOrchestratorInput()
+            oInput = CompressedObject<TriggerOrchestratorInput>.Create(
+                new TriggerOrchestratorInput()
             {
                 TestParameters = testParameters,
                 Direct = input.Direct,
@@ -421,14 +472,17 @@ namespace DurableFunctionBenchmark
                 ItemCount = itemCount,
                 RunId = runId,
                 DocumentSize = documentSize,
+                Documents = documents,
                 PayloadSize = input.PayloadSize,
                 LaunchStartTime = startTime,
                 LaunchEndTime = endTime,
                 SubOrchestratorCount = subOrchestratorCount,
+                CosmosWaitFraction = cosmosWaitFraction,
                 CosmosThroughput = throughput,
-            };
+            }, compressionLevel);
 
-            instanceId = await starter.StartNewAsync(nameof(BandConductorOrchestrator), oInput);
+            instanceId = await starter.StartNewAsync(
+                nameof(BandConductorOrchestrator), oInput);
 
             return starter.CreateCheckStatusResponse(req, instanceId);
         }
